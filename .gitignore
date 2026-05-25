@@ -1,0 +1,4 @@
+.clang-format
+.clangd
+.vscode/
+compile_flags.txt
