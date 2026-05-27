@@ -22,17 +22,10 @@
 - The initial tape length must be in [0, 2147483647]
 ### format 1
 ```
-<cell> <cell> <cell> ...
-```
-or
-```
-<cell>,<cell>,<cell> ...
-```
-or
-```
+<cell> <cell>,<cell>
+<cell>, <cell>
 <cell>
-<cell>
-<cell> ...
+...
 ```
 - cell value: 0 ~ 255
 - file extension: .txt
@@ -42,6 +35,7 @@ or
 ```
 - cell value: character with ASCII code 0 ~ 255
 - file extension: .bin
+- one cell one byte
 ## example
 ```
 2
@@ -57,3 +51,14 @@ or
 - if now state is 0 and read 1, the machine will write 0, move left, and change state to 1
 - if now state is 1 and read 0, the machine will write 1, move right, and change state to 0
 - in this example, if now state is 1 and read 1, the machine will halt, because there is no instruction for state 1 and read 1
+## command line usage
+compile: `gcc ./main.c -o ./main.exe`
+run: `./main.exe <instruction_card_file> [ -t <tape_file> ] [ -o <output_file> ] [ -s <maximum_steps> ] [other flags]`
+- flags:
+    - `-p`/`--print`: print the state of the machine after each step
+    - `-h`/`--help`: print the help message and exit
+    - `-t`/`--tape`: specify the tape file, if not specified, the tape will be initialized with all cells set to 0 and length 1
+    - `-o`/`--output`: specify the output file, if not specified, the output will be printed to the console
+    - `-s`/`--step`: specify the maximum number of steps to execute, if not specified, the machine will run 2147483647 steps at most
+## output format
+- the output format is the same as the tape format, and the file extension is the same as the input tape file, if specified, otherwise the output will be printed to the console in format 1
