@@ -1,367 +1,537 @@
-#include <assert.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdnoreturn.h>
 #include <string.h>
 
+typedef unsigned char Cell;
+
 typedef struct {
     size_t next;
-    char read;
-    char write;
+    Cell read;
+    Cell write;
     char move;
 } Action;
 
 typedef struct {
+    size_t state;
+    size_t action_count;
     Action* actions;
-    size_t now_state;
-    char action_count;
 } Card;
 
-static Card* cards = NULL;
-static size_t card_count = 0;
-
-typedef struct Tape Tape;
-struct Tape {
-    char* data;
-    Tape* left_bound;
-    Tape* right_bound;
+typedef struct TapeCell TapeCell;
+struct TapeCell {
+    TapeCell* left;
+    TapeCell* right;
+    Cell value;
+    bool visible;
 };
-#define tape_size 2147483647
-static size_t tape_count = 0;
-static Tape* head_tape = NULL;
-static int head_pos = 0;
-static Tape* start_tape = NULL;
-static Tape* end_tape = NULL;
-static int start_pos = -1;
-static int end_pos = -1;
 
-static void init(char* card_file, char* tape_file, int tape_mode, char* output_file);
-static void run(char* output_file, int print_tape, size_t max_steps);
+typedef struct {
+    TapeCell* head;
+    TapeCell* leftmost;
+    TapeCell* rightmost;
+    TapeCell* visible_leftmost;
+    TapeCell* visible_rightmost;
+    size_t head_offset;
+} Tape;
 
-static void create_tapes(int is_left, Tape* now_tape);
-static void read_initial_tape(char* tape_file, int mode);
-static void free_tapes(void);
-static void read_cards(char* card_file);
-static void free_cards(void);
+typedef struct {
+    Card* cards;
+    size_t card_count;
+    Tape tape;
+    FILE* trace_file;
+} Machine;
 
-static char write_move_and_read(char move, char write_value);
-noreturn static void allocate_error(char* function_name);
+typedef struct {
+    char* card_file;
+    char* tape_file;
+    char* output_file;
+    size_t max_steps;
+    bool trace_enabled;
+    bool tape_is_text;
+} Options;
 
-static void print_help(char* program_name) {
-    printf("Usage: %s <card_file> [(-t | --tape) <tape_file>] [(-o | --output) <output_file>] [(-s | --step) <max_steps>] [-p | -print] [-h | --help]\n", program_name);
+static void print_help(const char* program_name);
+static void parse_arguments(int argc, char* argv[], Options* options);
+static void machine_init(Machine* machine, const char* card_file, const char* tape_file, bool tape_is_text, const char* output_file);
+static void machine_run(Machine* machine, bool trace_enabled, size_t max_steps);
+static void machine_cleanup(Machine* machine);
+
+static void read_cards(Machine* machine, const char* card_file);
+static void read_initial_tape(Tape* tape, const char* tape_file, bool text_mode);
+static void tape_init_blank(Tape* tape);
+static void tape_free(Tape* tape);
+static Cell tape_step(Tape* tape, char move, Cell write_value);
+
+static void print_trace(FILE* output, size_t step, size_t card_index, const Action* action, Cell current_value, const Tape* tape);
+
+static void* xcalloc(size_t count, size_t size, const char* function_name);
+noreturn static void allocate_error(const char* function_name);
+
+static TapeCell* tape_cell_new(Cell value);
+static void tape_reveal_cell(Tape* tape, TapeCell* cell);
+static int read_text_cell(FILE* file, Cell* value);
+static int read_binary_cell(FILE* file, Cell* value);
+static bool is_tape_delimiter(int ch);
+static bool has_suffix(const char* value, const char* suffix);
+
+static void print_help(const char* program_name) {
+    printf("Usage: %s <card_file> [(-t | --tape) <tape_file>] [(-o | --output) <output_file>] [(-s | --step) <max_steps>] [-p | --print] [-h | --help]\n", program_name);
     printf(
         "Flags:\n"
         "  -t <tape_file>\n"
         "  --tape   <tape_file>   Specify the initial tape file (text or binary)\n"
         "  -o <output_file>\n"
-        "  --output <output_file> Specify the output file for the final tape state\n"
+        "  --output <output_file> Mirror the step trace to a file\n"
         "  -s <max_steps>\n"
         "  --step   <max_steps>   Set a maximum number of steps to execute (default: 2147483647)\n"
         "  -p\n"
-        "  --print                Print the final tape state to standard output\n"
+        "  --print                Print the step trace after each step\n"
         "  -h\n"
         "  --help                 Show this help message\n");
 }
 
-static void print_all_tape(char* output_file, size_t step, Card* card, char current_value, Action* action) {
-    FILE* output = stdout;
-    if (output_file != NULL) {
-        output = fopen(output_file, "a");
-        if (output == NULL) {
-            fprintf(stderr, "Failed to open output file: %s\n", output_file);
-            exit(EXIT_FAILURE);
-        }
-    }
-    fprintf(output, "Step %zu: Card %zu, Read %d, Write %d, Move %c, Next Card %zu\n", step, card - cards, (unsigned char)current_value, (unsigned char)action->write, action->move, action->next);
-    Tape* current_tape = start_tape;
-    size_t head_index = 0;
-    size_t found_head = 0;
-    while (current_tape != NULL) {
-        int start_pos_in_scope = (current_tape == start_tape) ? start_pos : 0;
-        int end_pos_in_scope = (current_tape == end_tape) ? end_pos : tape_size;
-        for (int i = start_pos_in_scope; i < end_pos_in_scope; ++i) {
-            if (current_tape == head_tape && i == head_pos)
-                found_head = head_index;
-            else
-                ++head_index;
-            fprintf(output, "%3d ", (unsigned char)current_tape->data[i]);
-        }
-        current_tape = current_tape->right_bound;
-    }
-    fprintf(output, "\n");
-    for (size_t i = 0; i < found_head; ++i)
-        fprintf(output, "    ");
-    fprintf(output, "  ^\n");
-    if (output != NULL && output != stdout)
-        fclose(output);
-}
-
-int main(int argc, char* argv[]) {
+static void parse_arguments(int argc, char* argv[], Options* options) {
     if (argc < 2) {
         print_help(argv[0]);
-        return EXIT_FAILURE;
+        exit(EXIT_FAILURE);
     }
-    char* card_file = NULL;
+
     if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         print_help(argv[0]);
-        return EXIT_SUCCESS;
-    } else if (argv[1][0] == '-') {
-        fprintf(stderr, "Expected card file as the first argument\n");
-        return EXIT_FAILURE;
+        exit(EXIT_SUCCESS);
     }
-    card_file = argv[1];
-    char* tape_file = NULL;
-    char* output_file = NULL;
-    int print_tape = 0;
-    int tape_mode = 0;  // 1 for text, 0 for binary
-    size_t max_steps = 2147483647;
+
+    if (argv[1][0] == '-') {
+        fprintf(stderr, "Expected card file as the first argument\n");
+        exit(EXIT_FAILURE);
+    }
+
+    options->card_file = argv[1];
+    options->tape_file = NULL;
+    options->output_file = NULL;
+    options->trace_enabled = false;
+    options->tape_is_text = false;
+    options->max_steps = 2147483647u;
+
     for (int i = 2; i < argc; ++i) {
         if (argv[i][0] == '-') {
             if (argv[i][1] == 't' || (argv[i][1] == '-' && strcmp(argv[i], "--tape") == 0)) {
                 if (i + 1 >= argc || argv[i + 1][0] == '-') {
                     fprintf(stderr, "Expected tape file after -t flag\n");
-                    return EXIT_FAILURE;
+                    exit(EXIT_FAILURE);
                 }
-                tape_file = argv[++i];
-                size_t len = strlen(tape_file);
-                if (len >= 4 && strcmp(tape_file + len - 4, ".txt") == 0)
-                    tape_mode = 1;
+                options->tape_file = argv[++i];
+                options->tape_is_text = has_suffix(options->tape_file, ".txt");
             } else if (argv[i][1] == 'o' || (argv[i][1] == '-' && strcmp(argv[i], "--output") == 0)) {
                 if (i + 1 >= argc || argv[i + 1][0] == '-') {
                     fprintf(stderr, "Expected output file after -o flag\n");
-                    return EXIT_FAILURE;
+                    exit(EXIT_FAILURE);
                 }
-                output_file = argv[++i];
+                options->output_file = argv[++i];
             } else if (argv[i][1] == 'p' || (argv[i][1] == '-' && strcmp(argv[i], "--print") == 0)) {
-                print_tape = 1;
+                options->trace_enabled = true;
             } else if (argv[i][1] == 's' || (argv[i][1] == '-' && strcmp(argv[i], "--step") == 0)) {
                 if (i + 1 >= argc || argv[i + 1][0] == '-') {
                     fprintf(stderr, "Expected max steps after -s flag\n");
-                    return EXIT_FAILURE;
+                    exit(EXIT_FAILURE);
                 }
-                max_steps = strtoull(argv[++i], NULL, 10);
+                options->max_steps = strtoull(argv[++i], NULL, 10);
             } else if (argv[i][1] == 'h' || (argv[i][1] == '-' && strcmp(argv[i], "--help") == 0)) {
                 print_help(argv[0]);
-                return EXIT_SUCCESS;
+                exit(EXIT_SUCCESS);
             } else {
                 fprintf(stderr, "Unknown flag: %s\n", argv[i]);
-                return EXIT_FAILURE;
+                exit(EXIT_FAILURE);
             }
         } else {
             fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
-            return EXIT_FAILURE;
-        }
-    }
-
-    init(card_file, tape_file, tape_mode, output_file);
-    run(output_file, print_tape, max_steps);
-    free_tapes();
-    free_cards();
-    return EXIT_SUCCESS;
-}
-
-void init(char* card_file, char* tape_file, int tape_mode, char* output_file) {
-    ++tape_count;
-    head_tape = (Tape*)malloc(sizeof(Tape));
-    if (head_tape == NULL) allocate_error("init 0");
-    // use calloc to initialize all cells to 0
-    head_tape->data = (char*)calloc(tape_size, sizeof(char));
-    if (head_tape->data == NULL) allocate_error("init 1");
-    head_tape->left_bound = NULL;
-    head_tape->right_bound = NULL;
-    start_tape = head_tape;
-    end_tape = head_tape;
-    start_pos = 0;
-    end_pos = 0;
-    if (tape_file != NULL)
-        read_initial_tape(tape_file, tape_mode);
-    read_cards(card_file);
-    // reset output file to empty
-    FILE* output = fopen(output_file, "w");
-    if (output == NULL) {
-        fprintf(stderr, "Failed to open output file: %s\n", output_file);
-        exit(EXIT_FAILURE);
-    }
-    fclose(output);
-}
-
-void run(char* output_file, int print_tape, size_t max_steps) {
-    size_t current_card = 0;
-    for (size_t step = 0; step < max_steps; ++step) {
-        Card* card = &cards[current_card];
-        char current_value = head_tape->data[head_pos];
-        int action_index = -1;
-        for (int i = 0; i < card->action_count; ++i) {
-            if (card->actions[i].read == current_value) {
-                action_index = i;
-                break;
-            }
-        }
-        if (action_index == -1) break;  // no matching action, halt
-        Action* action = &card->actions[action_index];
-        current_card = action->next;
-        current_value = write_move_and_read(action->move, action->write);
-        if (print_tape) {
-            print_all_tape(NULL, step, card, current_value, action);
-            print_all_tape(output_file, step, card, current_value, action);
+            exit(EXIT_FAILURE);
         }
     }
 }
 
-void create_tapes(int is_left, Tape* now_tape) {
-    ++tape_count;
-    Tape* new_tape = (Tape*)malloc(sizeof(Tape));
-    if (new_tape == NULL) allocate_error("create_tapes 0");
-    new_tape->data = (char*)malloc(sizeof(char) * tape_size);
-    if (new_tape->data == NULL) allocate_error("create_tapes 1");
-    assert((is_left && now_tape->right_bound == NULL) || (!is_left && now_tape->left_bound == NULL));
-    if (is_left) {
-        now_tape->left_bound = new_tape;
-        new_tape->right_bound = now_tape;
-        new_tape->left_bound = NULL;
-    } else {
-        now_tape->right_bound = new_tape;
-        new_tape->left_bound = now_tape;
-        new_tape->right_bound = NULL;
+static void* xcalloc(size_t count, size_t size, const char* function_name) {
+    void* memory = calloc(count, size);
+    if (memory == NULL) {
+        allocate_error(function_name);
+    }
+    return memory;
+}
+
+static TapeCell* tape_cell_new(Cell value) {
+    TapeCell* cell = (TapeCell*)xcalloc(1, sizeof(*cell), "tape cell");
+    cell->value = value;
+    return cell;
+}
+
+static void tape_reveal_cell(Tape* tape, TapeCell* cell) {
+    if (cell == NULL || cell->visible) {
+        return;
+    }
+
+    cell->visible = true;
+    if (cell->left == NULL) {
+        tape->visible_leftmost = cell;
+    }
+    if (cell->right == NULL) {
+        tape->visible_rightmost = cell;
     }
 }
 
-void read_initial_tape(char* tape_file, int mode) {
-    FILE* file = NULL;
-    if (mode)
-        file = fopen(tape_file, "r");
-    else
-        file = fopen(tape_file, "rb");
+static void tape_init_blank(Tape* tape) {
+    TapeCell* cell = tape_cell_new(0);
+    cell->visible = true;
+    tape->head = cell;
+    tape->leftmost = cell;
+    tape->rightmost = cell;
+    tape->visible_leftmost = cell;
+    tape->visible_rightmost = cell;
+    tape->head_offset = 0;
+}
+
+static void tape_free(Tape* tape) {
+    TapeCell* cell = tape->leftmost;
+    if (cell == NULL) {
+        cell = tape->head;
+        while (cell != NULL && cell->left != NULL) {
+            cell = cell->left;
+        }
+    }
+
+    while (cell != NULL) {
+        TapeCell* next = cell->right;
+        free(cell);
+        cell = next;
+    }
+
+    tape->head = NULL;
+    tape->leftmost = NULL;
+    tape->rightmost = NULL;
+    tape->visible_leftmost = NULL;
+    tape->visible_rightmost = NULL;
+    tape->head_offset = 0;
+}
+
+static bool is_tape_delimiter(int ch) {
+    return ch == ',' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\f' || ch == '\v';
+}
+
+static int read_text_cell(FILE* file, Cell* value) {
+    long parsed = 0;
+    int check = fscanf(file, " %ld", &parsed);
+    if (check == 1) {
+        int ch = fgetc(file);
+        while (ch != EOF && is_tape_delimiter(ch)) {
+            ch = fgetc(file);
+        }
+        if (ch != EOF && ungetc(ch, file) == EOF) {
+            return -1;
+        }
+        if (parsed < 0 || parsed > UCHAR_MAX) {
+            return -1;
+        }
+        *value = (Cell)parsed;
+        return 1;
+    }
+    if (check == EOF) {
+        return 0;
+    }
+    return -1;
+}
+
+static int read_binary_cell(FILE* file, Cell* value) {
+    size_t check = fread(value, sizeof(*value), 1, file);
+    if (check == 1) {
+        return 1;
+    }
+    if (feof(file)) {
+        return 0;
+    }
+    return -1;
+}
+
+static void read_initial_tape(Tape* tape, const char* tape_file, bool text_mode) {
+    FILE* file = fopen(tape_file, text_mode ? "r" : "rb");
     if (file == NULL) {
         fprintf(stderr, "Failed to open tape file: %s\n", tape_file);
         exit(EXIT_FAILURE);
     }
-    int index = 0;
-    while (index < tape_size) {
-        char value;
-        if (mode) {
-            int check = fscanf(file, " %hhd%*[, \t\r\n\f\v]", &value);
-            if (check != 1) break;
-        } else {
-            size_t check = fread(&value, sizeof(char), 1, file);
-            if (check != 1) break;
+
+    TapeCell* first = NULL;
+    TapeCell* last = NULL;
+    size_t cell_count = 0;
+
+    for (;;) {
+        Cell value = 0;
+        int status = text_mode ? read_text_cell(file, &value) : read_binary_cell(file, &value);
+        if (status == 0) {
+            break;
         }
-        head_tape->data[index++] = value;
+        if (status < 0) {
+            fclose(file);
+            fprintf(stderr, "Failed to read tape file: %s\n", tape_file);
+            exit(EXIT_FAILURE);
+        }
+
+        TapeCell* cell = tape_cell_new(value);
+        cell->visible = true;
+        if (first == NULL) {
+            first = cell;
+        } else {
+            last->right = cell;
+            cell->left = last;
+        }
+        last = cell;
+        ++cell_count;
     }
+
     fclose(file);
-    start_pos = 0;
-    end_pos = index;
-}
+    tape_free(tape);
 
-void free_tapes(void) {
-    Tape* current = head_tape;
-    while (current->left_bound != NULL)
-        current = current->left_bound;
-    while (current != NULL) {
-        Tape* next = current->right_bound;
-        free(current->data);
-        free(current);
-        current = next;
+    if (cell_count == 0) {
+        tape_init_blank(tape);
+        return;
     }
+
+    tape->head = first;
+    tape->leftmost = first;
+    tape->rightmost = last;
+    tape->visible_leftmost = first;
+    tape->visible_rightmost = last;
+    tape->head_offset = 0;
 }
 
-void read_cards(char* card_file) {
+static Cell tape_step(Tape* tape, char move, Cell write_value) {
+    tape->head->value = write_value;
+    if (write_value != 0) {
+        tape_reveal_cell(tape, tape->head);
+    }
+
+    if (move == 'L') {
+        if (tape->head->left == NULL) {
+            TapeCell* new_head = tape_cell_new(0);
+            new_head->right = tape->head;
+            tape->head->left = new_head;
+            tape->leftmost = new_head;
+            tape->head = new_head;
+            tape->head_offset = 0;
+        } else {
+            tape->head = tape->head->left;
+            --tape->head_offset;
+        }
+    } else if (move == 'R') {
+        if (tape->head->right == NULL) {
+            TapeCell* new_head = tape_cell_new(0);
+            new_head->left = tape->head;
+            tape->head->right = new_head;
+            tape->rightmost = new_head;
+            tape->head = new_head;
+        } else {
+            tape->head = tape->head->right;
+        }
+        ++tape->head_offset;
+    } else if (move != 'S') {
+        fprintf(stderr, "Invalid move character: %c\n", move);
+        exit(EXIT_FAILURE);
+    }
+
+    return tape->head->value;
+}
+
+static void read_cards(Machine* machine, const char* card_file) {
     FILE* file = fopen(card_file, "r");
     if (file == NULL) {
         fprintf(stderr, "Failed to open card file: %s\n", card_file);
         exit(EXIT_FAILURE);
     }
-    int check = fscanf(file, " %zu", &card_count);
-    if (check == EOF || check != 1) {
+
+    size_t card_count = 0;
+    if (fscanf(file, " %zu", &card_count) != 1 || card_count == 0) {
         fprintf(stderr, "Failed to read card count from file: %s\n", card_file);
         exit(EXIT_FAILURE);
     }
-    cards = malloc(sizeof(Card) * card_count);
-    if (cards == NULL) allocate_error("read_cards 0");
-    for (size_t i = 0; i < card_count; ++i) {
-        Card* card = &cards[i];
-        check = fscanf(file, " %zu %hhd", &card->now_state, &card->action_count);
-        if (check == EOF || check != 2) {
-            fprintf(stderr, "Failed to read card %zu from file: %s\n", i, card_file);
+
+    machine->cards = (Card*)xcalloc(card_count, sizeof(*machine->cards), "read_cards 0");
+    machine->card_count = card_count;
+
+    for (size_t card_index = 0; card_index < card_count; ++card_index) {
+        Card* card = &machine->cards[card_index];
+        size_t state = 0;
+        size_t action_count = 0;
+        if (fscanf(file, " %zu %zu", &state, &action_count) != 2 || state != card_index || action_count > UCHAR_MAX) {
+            fprintf(stderr, "Failed to read card %zu from file: %s\n", card_index, card_file);
             exit(EXIT_FAILURE);
         }
-        card->actions = malloc(sizeof(Action*) * (size_t)card->action_count);
-        if (card->actions == NULL) allocate_error("read_cards 1");
-        for (size_t j = 0; j < (size_t)card->action_count; ++j) {
-            char move;
-            // check = 0;
-            // check += fscanf(file, " %hhd", &card->actions[j].read);
-            // check += fscanf(file, " %hhd", &card->actions[j].write);
-            // check += fscanf(file, " %c", &move);
-            // check += fscanf(file, " %zu", &card->actions[j].next);
-            check = fscanf(file, " %hhd %hhd %c %zu", &card->actions[j].read, &card->actions[j].write, &move, &card->actions[j].next);
-            if (check == EOF || check != 4) {
-                fprintf(stderr, "Failed to read action for card %zu, action %zu\n", i, j);
+
+        card->state = state;
+        card->action_count = action_count;
+        card->actions = action_count == 0 ? NULL : (Action*)xcalloc(action_count, sizeof(*card->actions), "read_cards 1");
+
+        for (size_t action_index = 0; action_index < action_count; ++action_index) {
+            long read_value = 0;
+            long write_value = 0;
+            char move = '\0';
+            size_t next_state = 0;
+            if (fscanf(file, " %ld %ld %c %zu", &read_value, &write_value, &move, &next_state) != 4 || read_value < 0 || read_value > UCHAR_MAX || write_value < 0 || write_value > UCHAR_MAX || next_state >= card_count) {
+                fprintf(stderr, "Failed to read action for card %zu, action %zu\n", card_index, action_index);
                 exit(EXIT_FAILURE);
             }
-            if (move == 'R' || move == 'L' || move == 'S')
-                card->actions[j].move = move;
-            else if (move == 'r' || move == 'l' || move == 's')
-                card->actions[j].move = (char)(move - ('a' - 'A'));
-            else {
+
+            if (move >= 'a' && move <= 'z') {
+                move = (char)(move - ('a' - 'A'));
+            }
+
+            if (move != 'R' && move != 'L' && move != 'S') {
                 fprintf(stderr, "Invalid move character: %c\n", move);
                 exit(EXIT_FAILURE);
             }
+
+            card->actions[action_index].read = (Cell)read_value;
+            card->actions[action_index].write = (Cell)write_value;
+            card->actions[action_index].move = move;
+            card->actions[action_index].next = next_state;
         }
     }
+
     fclose(file);
 }
 
-void free_cards(void) {
-    for (size_t i = 0; i < card_count; ++i)
-        free(cards[i].actions);
-    free(cards);
-}
+static void print_trace(FILE* output, size_t step, size_t card_index, const Action* action, Cell current_value, const Tape* tape) {
+    fprintf(output, "Step %zu: Card %zu, Read %u, Write %u, Move %c, Next Card %zu\n", step, card_index, (unsigned int)current_value, (unsigned int)action->write, action->move, action->next);
 
-char write_move_and_read(char move, char write_value) {
-    head_tape->data[head_pos] = write_value;
-    if (move == 'L') {
-        if (head_pos > 0)
-            --head_pos;
-        else {
-            if (head_tape->left_bound == NULL)
-                create_tapes(1, head_tape);
-            else {
-                head_tape = head_tape->left_bound;
-                head_pos = tape_size - 1;
-            }
+    for (const TapeCell* cell = tape->visible_leftmost; cell != NULL; cell = cell->right) {
+        fprintf(output, "%3u ", (unsigned int)cell->value);
+        if (cell == tape->visible_rightmost) {
+            break;
         }
-        if (head_tape == start_tape && head_pos < start_pos)
-            start_pos = head_pos;
-        else if (head_tape->right_bound == start_tape) {
-            start_tape = head_tape;
-            start_pos = tape_size - 1;
-        }
-    } else if (move == 'R') {
-        if (head_pos < tape_size - 1)
-            ++head_pos;
-        else {
-            if (head_tape->right_bound == NULL)
-                create_tapes(0, head_tape);
-            else {
-                head_tape = head_tape->right_bound;
-                head_pos = 0;
-            }
-        }
-        if (head_tape == end_tape && head_pos > end_pos)
-            end_pos = head_pos;
-        else if (head_tape->left_bound == end_tape) {
-            end_tape = head_tape;
-            end_pos = 0;
-        }
-    } else if (move != 'S') {
-        fprintf(stderr, "Invalid move character: %c\n", move);
-        exit(EXIT_FAILURE);
     }
-    return head_tape->data[head_pos];
+
+    fprintf(output, "\n");
+
+    size_t head_offset = 0;
+    bool found_head = false;
+    for (const TapeCell* cell = tape->visible_leftmost; cell != NULL; cell = cell->right) {
+        if (cell == tape->head) {
+            found_head = true;
+            break;
+        }
+        if (cell == tape->visible_rightmost) {
+            break;
+        }
+        ++head_offset;
+    }
+
+    if (!found_head) {
+        head_offset = 0;
+    }
+
+    for (size_t i = 0; i < head_offset; ++i) {
+        fputs("    ", output);
+    }
+
+    fputs("  ^\n", output);
 }
 
-void allocate_error(char* function_name) {
+static void machine_init(Machine* machine, const char* card_file, const char* tape_file, bool tape_is_text, const char* output_file) {
+    machine->cards = NULL;
+    machine->card_count = 0;
+    machine->trace_file = NULL;
+    machine->tape.head = NULL;
+    machine->tape.leftmost = NULL;
+    machine->tape.rightmost = NULL;
+    machine->tape.head_offset = 0;
+
+    tape_init_blank(&machine->tape);
+    if (tape_file != NULL) {
+        read_initial_tape(&machine->tape, tape_file, tape_is_text);
+    }
+
+    read_cards(machine, card_file);
+
+    if (output_file != NULL) {
+        machine->trace_file = fopen(output_file, "w");
+        if (machine->trace_file == NULL) {
+            fprintf(stderr, "Failed to open output file: %s\n", output_file);
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+static void machine_run(Machine* machine, bool trace_enabled, size_t max_steps) {
+    size_t current_state = 0;
+
+    for (size_t step = 0; step < max_steps; ++step) {
+        if (current_state >= machine->card_count) {
+            break;
+        }
+
+        Card* card = &machine->cards[current_state];
+        Cell read_value = machine->tape.head->value;
+        const Action* action = NULL;
+
+        for (size_t action_index = 0; action_index < card->action_count; ++action_index) {
+            if (card->actions[action_index].read == read_value) {
+                action = &card->actions[action_index];
+                break;
+            }
+        }
+
+        if (action == NULL) {
+            break;
+        }
+
+        size_t card_index = current_state;
+        current_state = action->next;
+        Cell current_value = tape_step(&machine->tape, action->move, action->write);
+
+        if (trace_enabled) {
+            print_trace(stdout, step, card_index, action, current_value, &machine->tape);
+            if (machine->trace_file != NULL) {
+                print_trace(machine->trace_file, step, card_index, action, current_value, &machine->tape);
+            }
+        }
+    }
+}
+
+static void machine_cleanup(Machine* machine) {
+    if (machine->trace_file != NULL) {
+        fclose(machine->trace_file);
+        machine->trace_file = NULL;
+    }
+
+    tape_free(&machine->tape);
+
+    for (size_t i = 0; i < machine->card_count; ++i) {
+        free(machine->cards[i].actions);
+    }
+
+    free(machine->cards);
+    machine->cards = NULL;
+    machine->card_count = 0;
+}
+
+static bool has_suffix(const char* value, const char* suffix) {
+    size_t value_length = strlen(value);
+    size_t suffix_length = strlen(suffix);
+    return value_length >= suffix_length && strcmp(value + value_length - suffix_length, suffix) == 0;
+}
+
+int main(int argc, char* argv[]) {
+    Options options = {0};
+    parse_arguments(argc, argv, &options);
+
+    Machine machine = {0};
+    machine_init(&machine, options.card_file, options.tape_file, options.tape_is_text, options.output_file);
+    machine_run(&machine, options.trace_enabled, options.max_steps);
+    machine_cleanup(&machine);
+
+    return EXIT_SUCCESS;
+}
+
+void allocate_error(const char* function_name) {
     fprintf(stderr, "Failed to allocate memory in function: %s\n", function_name);
     exit(EXIT_FAILURE);
 }
