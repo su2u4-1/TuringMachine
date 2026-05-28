@@ -4,18 +4,21 @@ Step 0: Card 0, Read 1, Write 1, Move R, Next Card 0
 Step 1: Card 0, Read 1, Write 1, Move R, Next Card 0
   1   1   1   0   1   1 
           ^
-Step 2: Card 0, Read 0, Write 1, Move R, Next Card 0
+Step 2: Card 0, Read 1, Write 1, Move R, Next Card 0
   1   1   1   0   1   1 
               ^
-Step 3: Card 0, Read 1, Write 1, Move R, Next Card 1
+Step 3: Card 0, Read 0, Write 1, Move R, Next Card 1
   1   1   1   1   1   1 
                   ^
 Step 4: Card 1, Read 1, Write 1, Move R, Next Card 1
   1   1   1   1   1   1 
                       ^
-Step 5: Card 1, Read 0, Write 1, Move R, Next Card 1
+Step 5: Card 1, Read 1, Write 1, Move R, Next Card 1
   1   1   1   1   1   1 
-  ^
-Step 6: Card 1, Read 1, Write 0, Move L, Next Card 2
-  1   1   1   1   1   1 
+                          ^
+Step 6: Card 1, Read 0, Write 0, Move L, Next Card 2
+  1   1   1   1   1   1   0 
+                      ^
+Step 7: Card 2, Read 1, Write 0, Move S, Next Card 2
+  1   1   1   1   1   0   0 
                       ^
