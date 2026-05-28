@@ -2,3 +2,4 @@
 .clangd
 .vscode/
 compile_flags.txt
+main.exe
